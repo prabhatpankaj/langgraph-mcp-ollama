@@ -1,21 +1,18 @@
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from utils import format_agent_response
-import asyncio
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 app = FastAPI()
-
 model = ChatOllama(model="llama3.2")
 
-# Pydantic schema for request body
 class QueryRequest(BaseModel):
     query: str
 
-async def process_query(message: str):
+async def process_query(query: str):
     async with MultiServerMCPClient({
         "strings": {
             "command": "python",
@@ -28,9 +25,14 @@ async def process_query(message: str):
             "transport": "stdio",
         }
     }) as client:
-        agent = create_react_agent(model, client.get_tools())
-        res = await agent.ainvoke({"messages": message})
-        return format_agent_response(res)
+        tools = client.get_tools()
+
+        # ✅ Use ReAct-style agent from LangGraph
+        agent = create_react_agent(model, tools)
+
+        # Run the agent directly
+        result = await agent.ainvoke({"messages": query})
+        return format_agent_response(result)
 
 @app.post("/query")
 async def handle_post_query(request: QueryRequest):
