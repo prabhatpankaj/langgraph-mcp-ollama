@@ -1,10 +1,11 @@
+# app.py
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_react_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from utils import format_agent_response
+from tool_graph import build_tool_graph
+from states.tool_state import ToolGraphState
 
 app = FastAPI()
 model = ChatOllama(model="llama3.2")
@@ -12,7 +13,8 @@ model = ChatOllama(model="llama3.2")
 class QueryRequest(BaseModel):
     query: str
 
-async def process_query(query: str):
+@app.post("/tools")
+async def run_tools(request: QueryRequest):
     async with MultiServerMCPClient({
         "strings": {
             "command": "python",
@@ -25,19 +27,11 @@ async def process_query(query: str):
             "transport": "stdio",
         }
     }) as client:
-        tools = client.get_tools()
+        tools = {t.name: t for t in client.get_tools()}
+        graph = build_tool_graph(model, tools)
+        result = await graph.ainvoke({"input_text": request.query})
+        return JSONResponse(content=result)
 
-        # ✅ Use ReAct-style agent from LangGraph
-        agent = create_react_agent(model, tools)
-
-        # Run the agent directly
-        result = await agent.ainvoke({"messages": query})
-        return format_agent_response(result)
-
-@app.post("/query")
-async def handle_post_query(request: QueryRequest):
-    response = await process_query(request.query)
-    return JSONResponse(content=response)
 
 if __name__ == "__main__":
     import uvicorn
