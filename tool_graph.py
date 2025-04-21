@@ -1,22 +1,28 @@
 import json
 from langgraph.graph import StateGraph, END
 from states.tool_state import ToolGraphState
-from utils import clean_extracted_text, extract_date_fallback, extract_text_to_reverse
 
 def build_tool_graph(model, tools):
     graph = StateGraph(ToolGraphState)
 
-    # === Step 1: Parse user intent using LLM ===
     async def llm_parser(state):
         prompt = (
-            "You are a helpful assistant that extracts inputs for tools.\n"
-            "From the following user query, extract:\n"
-            "- `text_to_reverse`: the string inside single or double quotes that should be reversed\n"
-            "- `target_date`: the date mentioned for countdown in YYYY-MM-DD format\n\n"
-            f"User query:\n{state['input_text']}\n\n"
-            "Respond ONLY in JSON format like this:\n"
-            '{\n  "text_to_reverse": "LangGraph rocks!",\n  "target_date": "2025-12-31" }\n\n'
-            "Do not guess. If no date is found, leave it blank. If multiple dates, pick the most relevant one for countdown."
+            "You are a helpful assistant that extracts structured inputs for browser automation using Playwright.\n"
+            "From the user query, extract:\n"
+            "- `page_url`: full URL to open\n"
+            "- `element_selector`: the visible text to click, if any\n"
+            "- `extraction_target`: the kind of data to extract from the page after the click (e.g., 'car names', 'car specs', 'brand names')\n"
+            "- `wants_console_logs`: true if user asks for browser logs\n"
+            "- `wants_network_logs`: true if user wants network activity\n\n"
+            "Respond in JSON only, like:\n"
+            '{\n'
+            '  "page_url": "https://example.com",\n'
+            '  "element_selector": "View all 5 and below seater",\n'
+            '  "extraction_target": "car names",\n'
+            '  "wants_console_logs": false,\n'
+            '  "wants_network_logs": false\n'
+            '}\n\n'
+            f"User query:\n{state['input_text']}"
         )
 
         response = await model.ainvoke(prompt)
@@ -26,96 +32,124 @@ def build_tool_graph(model, tools):
         except Exception:
             parsed = {}
 
-        # Fallbacks
-        raw_text = parsed.get("text_to_reverse") or extract_text_to_reverse(state["input_text"])
-        raw_date = parsed.get("target_date") or extract_date_fallback(state["input_text"])
+        page_url = parsed.get("page_url", "").strip()
+        element_selector = parsed.get("element_selector", "").strip()
+        raw_target = parsed.get("extraction_target", "")
+        if isinstance(raw_target, list):
+            extraction_target = ", ".join(map(str, raw_target)).strip().lower()
+        elif isinstance(raw_target, str):
+            extraction_target = raw_target.strip().lower()
+        else:
+            extraction_target = ""
+
+        # Optional fallback
+        if not extraction_target and "car" in state["input_text"].lower():
+            extraction_target = "car names and specs"
 
         return {
-            "text_to_reverse": clean_extracted_text(raw_text) if raw_text else "",
-            "target_date": raw_date,
-            "wants_reversal": bool(raw_text),
-            "wants_countdown": bool(raw_date),
-            "wants_datetime": any(
-                x in state["input_text"].lower()
-                for x in ["current date", "current time", "what time is it", "now"]
-            ),
+            "page_url": page_url,
+            "element_selector": element_selector,
+            "extraction_target": extraction_target,
+            "wants_browser_open": bool(page_url),
+            "wants_click_action": bool(page_url and element_selector),
+            "wants_console_logs": parsed.get("wants_console_logs", False),
+            "wants_network_logs": parsed.get("wants_network_logs", False),
         }
 
-    # === Step 2: Prep (barrier node) ===
     def prep_inputs(state):
         return state
 
-    # === Step 3: Reverse string ===
-    async def reverse_string(state):
-        tool = tools["reverse_string"]
-        result = await tool.ainvoke({"text": state["text_to_reverse"]})
-        return {"reversed_text": result}
+    async def get_page_title(state):
+        tool = tools["open_page_and_get_title"]
+        result = await tool.ainvoke({"url": state["page_url"]})
+        return {"page_title": result}
 
-    # === Step 4: Days until target date ===
-    async def days_until(state):
-        tool = tools["days_until"]
-        result = await tool.ainvoke({"date_str": state["target_date"]})
-        return {"days_remaining": result}
+    async def click_element(state):
+        tool = tools["click_element_and_get_text"]
+        selector = state["element_selector"]
+        if selector.startswith("text="):
+            selector = selector.replace("text=", "").strip()
 
-    # === Step 5: Current datetime ===
-    async def current_datetime(state):
-        tool = tools["current_datetime"]
-        result = await tool.ainvoke({})
-        return {"current_time": result}
+        result = await tool.ainvoke({
+            "url": state["page_url"],
+            "selector": selector,
+            "extraction_target": state.get("extraction_target", "")
+        })
+        return {"click_result": result}
 
-    # === Step 6: Combine final results ===
+    async def get_console_logs(state):
+        tool = tools["get_console_logs"]
+        result = await tool.ainvoke({"last_n": 5})
+        return {"console_logs": result}
+
+    async def get_network_requests(state):
+        tool = tools["get_network_requests"]
+        result = await tool.ainvoke({"last_n": 5})
+        return {"network_requests": result}
+
     def combine_results(state):
         parts = []
 
-        if state.get("reversed_text"):
-            parts.append(f"The reversed string is: {state['reversed_text']}")
+        if state.get("page_title"):
+            parts.append(f"Page title is: {state['page_title']}")
 
-        if state.get("days_remaining") is not None:
-            date_label = state.get("target_date", "the date")
-            parts.append(f"Days until {date_label}: {state['days_remaining']}")
+        if state.get("click_result"):
+            try:
+                data = json.loads(state["click_result"])
+                extracted = data.get("extracted", [])
+                if isinstance(extracted, list):
+                    parts.append("Extracted Data:\n" + "\n".join(f"- {item}" for item in extracted))
+                else:
+                    parts.append(f"Extracted Result:\n{extracted}")
+            except Exception:
+                parts.append(f"Click result content:\n{state['click_result'][:300]}...")
 
-        if state.get("current_time"):
-            parts.append(f"Current date/time is: {state['current_time']}")
+        if state.get("console_logs"):
+            logs = "\n".join(log["text"] for log in state["console_logs"])
+            parts.append(f"Console Logs:\n{logs}")
+
+        if state.get("network_requests"):
+            reqs = "\n".join(req["url"] for req in state["network_requests"])
+            parts.append(f"Network Requests:\n{reqs}")
 
         return {
             "final_answer": "\n\n".join(parts)
         }
 
-    # === Step 7: End node ===
     def end_node(state):
         return state
 
-    # === Router based on extracted intent flags ===
     def tool_router(state):
         next_nodes = []
-        if state.get("wants_reversal"):
-            next_nodes.append("reverse_string")
-        if state.get("wants_countdown"):
-            next_nodes.append("days_until")
-        if state.get("wants_datetime"):
-            next_nodes.append("current_datetime")
+        if state.get("wants_browser_open"):
+            next_nodes.append("get_page_title")
+        if state.get("wants_click_action"):
+            next_nodes.append("click_element")
+        if state.get("wants_console_logs"):
+            next_nodes.append("get_console_logs")
+        if state.get("wants_network_logs"):
+            next_nodes.append("get_network_requests")
 
         print("[🧭 tool_router] Routing to:", next_nodes or ["combine_results"])
         return next_nodes or ["combine_results"]
 
-    # === Register Graph Nodes ===
+    # Register
     graph.add_node("llm_parser", llm_parser)
     graph.add_node("prep_inputs", prep_inputs)
-    graph.add_node("reverse_string", reverse_string)
-    graph.add_node("days_until", days_until)
-    graph.add_node("current_datetime", current_datetime)
+    graph.add_node("get_page_title", get_page_title)
+    graph.add_node("click_element", click_element)
+    graph.add_node("get_console_logs", get_console_logs)
+    graph.add_node("get_network_requests", get_network_requests)
     graph.add_node("combine_results", combine_results)
     graph.add_node("end", end_node)
 
-    # === Define Graph Flow ===
     graph.set_entry_point("llm_parser")
     graph.add_edge("llm_parser", "prep_inputs")
     graph.add_conditional_edges("prep_inputs", tool_router)
-
-    graph.add_edge("reverse_string", "combine_results")
-    graph.add_edge("days_until", "combine_results")
-    graph.add_edge("current_datetime", "combine_results")
+    graph.add_edge("get_page_title", "combine_results")
+    graph.add_edge("click_element", "combine_results")
+    graph.add_edge("get_console_logs", "combine_results")
+    graph.add_edge("get_network_requests", "combine_results")
     graph.add_edge("combine_results", "end")
-
     graph.set_finish_point("end")
     return graph.compile()

@@ -16,14 +16,9 @@ class QueryRequest(BaseModel):
 @app.post("/tools")
 async def run_tools(request: QueryRequest):
     async with MultiServerMCPClient({
-        "strings": {
+        "playwright": {
             "command": "python",
-            "args": ["tools/string_tools_server.py"],
-            "transport": "stdio",
-        },
-        "datetime": {
-            "command": "python",
-            "args": ["tools/datetime_tools_server.py"],
+            "args": ["tools/playwright_tools_server.py"],
             "transport": "stdio",
         }
     }) as client:

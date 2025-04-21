@@ -36,6 +36,7 @@ pydantic_core==2.33.1
 Pygments==2.19.1
 python-dotenv==1.1.0
 PyYAML==6.0.2
+playwright==1.51.0
 requests==2.32.3
 requests-toolbelt==1.0.0
 rich==14.0.0
